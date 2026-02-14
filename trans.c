@@ -238,7 +238,7 @@ unsigned int enterChoice(void)
                  "1 - store a formatted text file of accounts called\n"
                  "    \"accounts.txt\" for printing\n"
                  "2 - update an account\n"
-                 "3 - add a new account\n"
+                 "3 - create a new account\n"
                  "4 - delete an account\n"
                  "5 - end program\n? ");
 
