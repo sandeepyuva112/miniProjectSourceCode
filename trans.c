@@ -18,6 +18,15 @@ void textFile(FILE *readPtr);
 void updateRecord(FILE *fPtr);
 void newRecord(FILE *fPtr);
 void deleteRecord(FILE *fPtr);
+void clearInputBuffer(void);
+
+void clearInputBuffer(void)
+{
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF)
+    {
+    }
+}
 
 int main(int argc, char *argv[])
 {
@@ -68,7 +77,7 @@ int main(int argc, char *argv[])
 void textFile(FILE *readPtr)
 {
     FILE *writePtr; // accounts.txt file pointer
-    int result;     // used to test whether fread read any bytes
+    unsigned int recordsWritten = 0;
     // create clientData with default information
     struct clientData client = {0, "", "", 0.0};
 
@@ -83,18 +92,20 @@ void textFile(FILE *readPtr)
         fprintf(writePtr, "%-6s%-16s%-11s%10s\n", "Acct", "Last Name", "First Name", "Balance");
 
         // copy all records from random-access file into text file
-        while ((result = fread(&client, sizeof(struct clientData), 1, readPtr)) == 1)
+        while (fread(&client, sizeof(struct clientData), 1, readPtr) == 1)
         {
-            // write single record to text file
-            if (client.acctNum != 0)
+            // write only valid account records
+            if (client.acctNum >= 1 && client.acctNum <= 100)
             {
                 fprintf(writePtr, "%-6u%-16s%-11s%10.2f\n", client.acctNum, client.lastName, client.firstName,
                         client.balance);
+                ++recordsWritten;
             } // end if
         }     // end while
 
         fclose(writePtr); // fclose closes the file
-    }                     // end else
+        printf("accounts.txt generated with %u valid record(s).\n", recordsWritten);
+    } // end else
 } // end function textFile
 
 // update balance in record
@@ -109,6 +120,7 @@ void updateRecord(FILE *fPtr)
     printf("%s", "Enter account to update ( 1 - 100 ): ");
     if (scanf("%u", &account) != 1 || account < 1 || account > 100)
     {
+        clearInputBuffer();
         puts("Invalid account number.");
         return;
     }
@@ -133,6 +145,7 @@ void updateRecord(FILE *fPtr)
         printf("%s", "Enter charge ( + ) or payment ( - ): ");
         if (scanf("%lf", &transaction) != 1)
         {
+            clearInputBuffer();
             puts("Invalid transaction amount.");
             return;
         }
@@ -159,6 +172,7 @@ void deleteRecord(FILE *fPtr)
     printf("%s", "Enter account number to delete ( 1 - 100 ): ");
     if (scanf("%u", &accountNum) != 1 || accountNum < 1 || accountNum > 100)
     {
+        clearInputBuffer();
         puts("Invalid account number.");
         return;
     }
@@ -195,6 +209,7 @@ void newRecord(FILE *fPtr)
     printf("%s", "Enter new account number ( 1 - 100 ): ");
     if (scanf("%u", &accountNum) != 1 || accountNum < 1 || accountNum > 100)
     {
+        clearInputBuffer();
         puts("Invalid account number.");
         return;
     }
@@ -217,6 +232,7 @@ void newRecord(FILE *fPtr)
         printf("%s", "Enter lastname, firstname, balance\n? ");
         if (scanf("%14s%9s%lf", client.lastName, client.firstName, &client.balance) != 3)
         {
+            clearInputBuffer();
             puts("Invalid customer details.");
             return;
         }
@@ -233,19 +249,34 @@ void newRecord(FILE *fPtr)
 unsigned int enterChoice(void)
 {
     unsigned int menuChoice; // variable to store user's choice
-    // display available options
-    printf("%s", "\nEnter your choice\n"
-                 "1 - store a formatted text file of accounts called\n"
-                 "    \"accounts.txt\" for printing\n"
-                 "2 - update an account\n"
-                 "3 - create a new account\n"
-                 "4 - delete an account\n"
-                 "5 - end program\n? ");
 
-    if (scanf("%u", &menuChoice) != 1)
+    while (1)
     {
-        return 5;
-    }
+        // display available options
+        printf("%s", "\nEnter your choice\n"
+                     "1 - store a formatted text file of accounts called\n"
+                     "    \"accounts.txt\" for printing\n"
+                     "2 - update an account\n"
+                     "3 - add a new account\n"
+                     "4 - delete an account\n"
+                     "5 - end program\n? ");
 
-    return menuChoice;
+        if (scanf("%u", &menuChoice) != 1)
+        {
+            if (feof(stdin))
+            {
+                return 5;
+            }
+            clearInputBuffer();
+            puts("Invalid choice. Please enter a number from 1 to 5.");
+            continue;
+        }
+
+        if (menuChoice >= 1 && menuChoice <= 5)
+        {
+            return menuChoice;
+        }
+
+        puts("Invalid choice. Please enter a number from 1 to 5.");
+    }
 } // end function enterChoice
