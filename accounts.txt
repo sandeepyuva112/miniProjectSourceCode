@@ -1,3 +1,0 @@
-Acct  Last Name       First Name    Balance
-1     John            Joe           1222.00
-5     V               sandeep        512.00
