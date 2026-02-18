@@ -95,3 +95,29 @@ Review the given source code before starting the project:
 
 **Date:** 31/01/2026  
 **Time:** 06:42
+
+---
+
+## Troubleshooting: `trans.exe` blocked on Windows (Device Guard)
+
+If you see an error like:
+
+```
+'C:\\...\\trans.exe' was blocked by your organization's Device Guard policy
+```
+
+this is a **Windows policy restriction**, not a bug in the C source code.
+
+### Workarounds
+
+1. **Compile from source on your own machine/toolchain** instead of running a prebuilt executable.
+   - MinGW/GCC:
+     ```bash
+     gcc -Wall -Wextra -Werror -o trans trans.c
+     ./trans
+     ```
+2. **Run in Replit or another online IDE** (recommended in the project rules).
+3. **Use WSL/Linux environment** and compile there.
+4. If this is a managed college/company laptop, ask IT to allow unsigned student binaries.
+
+> Tip: submit source code (`trans.c`) and build instructions, rather than sharing a precompiled `trans.exe`.
