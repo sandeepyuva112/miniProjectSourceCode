@@ -1,1 +1,10 @@
 [2026-02-16 19:18:53] TRANSFER: 300.00 transferred from 5 to 1
+[2026-02-18 11:13:04] CREATE: Account 1 created for sandeep v with 200.00
+[2026-02-18 11:13:15] PIN: PIN generated for account 1
+[2026-02-18 11:14:03] CREATE: Account 2 created for sanjay m with 200.00
+[2026-02-18 11:14:18] TRANSFER: 100.00 transferred from 1 to 2
+[2026-02-18 20:33:24] AUTH_FAIL: Multiple failed PIN attempts
+[2026-02-18 20:34:21] CREATE: Account 3 created
+[2026-02-18 20:34:40] TRANSFER: 200.00 from 3 to 1
+[2026-02-18 20:43:49] AUTH_FAIL: Multiple failed PIN attempts
+[2026-02-18 20:44:26] UPDATE: Acct 3 updated by 100000000000000004384584304507619735463404765184.00
