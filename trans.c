@@ -4,15 +4,25 @@
 #include <string.h>
 #include <time.h>
 #include <ctype.h>
+#include <math.h>
 #include <errno.h>
 
-#define MAX_ACCOUNTS 100
+#define MAX_ACCOUNTS 100u
 #define DATA_FILE "credit.dat"
 #define PIN_FILE "pins.dat"
+#define LOG_FILE "transactions.log"
+#define ACCOUNTS_EXPORT_FILE "accounts.txt"
 
-// Limits for PIN entry
-#define MIN_PIN 0001
-#define MAX_PIN 9999
+// PIN policy (industry-style): exactly 4 digits, disallow 0000
+#define PIN_LENGTH 4
+#define PIN_MIN_VALUE 1u
+#define PIN_MAX_VALUE 9999u
+
+// Basic safety limit to prevent accidental huge amounts via input mistakes
+#define MAX_ABS_AMOUNT 1000000000.0
+
+#define STATEMENT_MAX_LINES 20
+#define LOG_LINE_MAX 512
 
 // clientData structure definition
 struct clientData
@@ -32,6 +42,7 @@ void deleteRecord(FILE *fPtr);
 void listRecords(FILE *fPtr);
 void transferFunds(FILE *fPtr);
 void changePin(FILE *fPtr);
+void viewStatement(FILE *fPtr);
 
 // File and logic helpers
 int ensureFileInitialized(FILE *fPtr);
@@ -44,6 +55,10 @@ int promptForNewPin(unsigned int accountNum, unsigned int *newHash);
 
 int readRecord(FILE *fPtr, unsigned int accountNum, struct clientData *client);
 int writeRecord(FILE *fPtr, unsigned int accountNum, const struct clientData *client);
+int writeTwoRecordsAtomic(
+    FILE *fPtr,
+    unsigned int accountA, const struct clientData *oldA, const struct clientData *newA,
+    unsigned int accountB, const struct clientData *oldB, const struct clientData *newB);
 int promptUnsignedInRange(const char *prompt, unsigned int min, unsigned int max, unsigned int *value);
 int promptDouble(const char *prompt, double *value);
 void logTransaction(const char *action, const char *details);
@@ -53,13 +68,16 @@ void printScreenHeader(const char *title);
 void printMessageBox(const char *label, const char *message);
 void waitForEnter(void);
 int readLine(char *buffer, size_t size);
+void printSystemError(const char *context);
+int parsePin(const char *input, unsigned int *pinValue);
+int lineMatchesAccount(const char *line, unsigned int accountNum);
 
 // --- UI FUNCTIONS ---
 
 void printScreenHeader(const char *title)
 {
     printf("\n+----------------------------------------------------------+\n");
-    printf("|                SECURE BANKING SOFTWARE (v2.0)            |\n");
+    printf("|                SECURE BANKING SOFTWARE (v2.1)            |\n");
     printf("+----------------------------------------------------------+\n");
     printf("| Screen: %-49s|\n", title);
     printf("+----------------------------------------------------------+\n");
@@ -85,6 +103,42 @@ int readLine(char *buffer, size_t size)
     return 1;
 }
 
+void printSystemError(const char *context)
+{
+    if (context == NULL) context = "Operation failed";
+
+    if (errno != 0) {
+        fprintf(stderr, "Error: %s: %s\n", context, strerror(errno));
+        return;
+    }
+
+    fprintf(stderr, "Error: %s\n", context);
+}
+
+int parsePin(const char *input, unsigned int *pinValue)
+{
+    size_t len;
+    unsigned int i;
+    char *end = NULL;
+    unsigned long parsed;
+
+    if (input == NULL || pinValue == NULL) return 0;
+
+    len = strlen(input);
+    if (len != PIN_LENGTH) return 0;
+
+    for (i = 0; i < PIN_LENGTH; ++i) {
+        if (!isdigit((unsigned char)input[i])) return 0;
+    }
+
+    errno = 0;
+    parsed = strtoul(input, &end, 10);
+    if (errno != 0 || end == input || *end != '\0' || parsed < PIN_MIN_VALUE || parsed > PIN_MAX_VALUE) return 0;
+
+    *pinValue = (unsigned int)parsed;
+    return 1;
+}
+
 // --- FILE INITIALIZATION ---
 
 int ensureFileInitialized(FILE *fPtr)
@@ -95,6 +149,7 @@ int ensureFileInitialized(FILE *fPtr)
 
     if (fseek(fPtr, 0L, SEEK_END) != 0) return 0;
     currentSize = ftell(fPtr);
+    if (currentSize < 0) return 0;
     
     if (currentSize >= expectedSize) {
         rewind(fPtr);
@@ -105,7 +160,7 @@ int ensureFileInitialized(FILE *fPtr)
         if (fwrite(&blankClient, sizeof(struct clientData), 1, fPtr) != 1) return 0;
         currentSize += (long)sizeof(struct clientData);
     }
-    fflush(fPtr);
+    if (fflush(fPtr) != 0) return 0;
     rewind(fPtr);
     return 1;
 }
@@ -123,16 +178,25 @@ int ensurePinFileInitialized(void)
         if (pinPtr == NULL) return 0;
     }
 
-    fseek(pinPtr, 0L, SEEK_END);
+    if (fseek(pinPtr, 0L, SEEK_END) != 0) {
+        fclose(pinPtr);
+        return 0;
+    }
     currentSize = ftell(pinPtr);
+    if (currentSize < 0) {
+        fclose(pinPtr);
+        return 0;
+    }
 
     while (currentSize < expectedSize) {
-        fwrite(&blankHash, sizeof(unsigned int), 1, pinPtr);
+        if (fwrite(&blankHash, sizeof(unsigned int), 1, pinPtr) != 1) {
+            fclose(pinPtr);
+            return 0;
+        }
         currentSize += (long)sizeof(unsigned int);
     }
 
-    fclose(pinPtr);
-    return 1;
+    return fclose(pinPtr) == 0;
 }
 
 // --- CORE LOGIC ---
@@ -155,6 +219,22 @@ int writeRecord(FILE *fPtr, unsigned int accountNum, const struct clientData *cl
     if (fwrite(client, sizeof(struct clientData), 1, fPtr) != 1) return 0;
     fflush(fPtr);
     return 1;
+}
+
+int writeTwoRecordsAtomic(
+    FILE *fPtr,
+    unsigned int accountA, const struct clientData *oldA, const struct clientData *newA,
+    unsigned int accountB, const struct clientData *oldB, const struct clientData *newB)
+{
+    if (!writeRecord(fPtr, accountA, newA)) return 0;
+
+    if (writeRecord(fPtr, accountB, newB)) return 1;
+
+    int savedErrno = errno;
+    (void)writeRecord(fPtr, accountB, oldB);
+    (void)writeRecord(fPtr, accountA, oldA);
+    errno = savedErrno;
+    return 0;
 }
 
 // --- SECURITY & HASHING FUNCTIONS ---
@@ -185,7 +265,10 @@ int readPinHash(unsigned int accountNum, unsigned int *pinHash)
     if (pinPtr == NULL) return 0;
 
     offset = (long)(accountNum - 1) * (long)sizeof(unsigned int);
-    fseek(pinPtr, offset, SEEK_SET);
+    if (fseek(pinPtr, offset, SEEK_SET) != 0) {
+        fclose(pinPtr);
+        return 0;
+    }
     
     if (fread(pinHash, sizeof(unsigned int), 1, pinPtr) != 1) {
         fclose(pinPtr);
@@ -206,7 +289,10 @@ int writePinHash(unsigned int accountNum, unsigned int pinHash)
     if (pinPtr == NULL) return 0;
 
     offset = (long)(accountNum - 1) * (long)sizeof(unsigned int);
-    fseek(pinPtr, offset, SEEK_SET);
+    if (fseek(pinPtr, offset, SEEK_SET) != 0) {
+        fclose(pinPtr);
+        return 0;
+    }
     
     if (fwrite(&pinHash, sizeof(unsigned int), 1, pinPtr) != 1) {
         fclose(pinPtr);
@@ -222,6 +308,7 @@ int authenticateUser(unsigned int accountNum)
     unsigned int storedHash;
     unsigned int computedHash;
     int attempts = 0;
+    char buffer[64];
 
     // Read stored hash
     if (!readPinHash(accountNum, &storedHash)) {
@@ -229,21 +316,34 @@ int authenticateUser(unsigned int accountNum)
         return 0;
     }
 
-    // If hash is 0, no PIN is set (insecure account)
+    // If hash is 0, no PIN is set yet; require setting it before continuing.
     if (storedHash == 0) {
-        puts("Notice: No PIN set for this account. Access granted.");
-        return 1; 
+        unsigned int newHash;
+        char details[96];
+
+        printMessageBox("SECURITY NOTICE", "No PIN is set for this account. You must set one now.");
+        if (!promptForNewPin(accountNum, &newHash)) {
+            puts("PIN setup cancelled.");
+            return 0;
+        }
+        if (!writePinHash(accountNum, newHash)) {
+            printSystemError("Failed to store PIN");
+            return 0;
+        }
+        snprintf(details, sizeof(details), "acct=%u pin_set=1", accountNum);
+        logTransaction("PIN_SET", details);
+        return 1;
     }
 
     while (attempts < 3) {
-        printf("Enter PIN for Account %u: ", accountNum);
-        if (scanf("%u", &inputPin) != 1) {
-            while(getchar() != '\n'); // flush buffer
-            puts("Invalid input format.");
+        printf("Enter %d-digit PIN for Account %u: ", PIN_LENGTH, accountNum);
+        if (!readLine(buffer, sizeof(buffer))) return 0;
+
+        if (!parsePin(buffer, &inputPin)) {
+            puts("Invalid PIN format. Use exactly 4 digits (0001-9999).");
             attempts++;
             continue;
         }
-        while(getchar() != '\n'); // flush buffer after scanf
 
         // Hash the input and compare
         computedHash = hashPin(accountNum, inputPin);
@@ -268,12 +368,10 @@ int promptForNewPin(unsigned int accountNum, unsigned int *newHash)
     char buffer[64];
 
     while(1) {
-        printf("\nSet new PIN (%u - %u): ", MIN_PIN, MAX_PIN);
+        printf("\nSet new %d-digit PIN (%04u - %04u): ", PIN_LENGTH, PIN_MIN_VALUE, PIN_MAX_VALUE);
         if (!readLine(buffer, sizeof(buffer))) return 0;
-        pin1 = (unsigned int)strtoul(buffer, NULL, 10);
-
-        if (pin1 < MIN_PIN || pin1 > MAX_PIN) {
-            printf("PIN must be between %u and %u digits.\n", MIN_PIN, MAX_PIN);
+        if (!parsePin(buffer, &pin1)) {
+            puts("PIN must be exactly 4 digits (0001-9999).");
             continue;
         }
 
@@ -285,7 +383,10 @@ int promptForNewPin(unsigned int accountNum, unsigned int *newHash)
 
         printf("Confirm PIN: ");
         if (!readLine(buffer, sizeof(buffer))) return 0;
-        pin2 = (unsigned int)strtoul(buffer, NULL, 10);
+        if (!parsePin(buffer, &pin2)) {
+            puts("PIN confirmation must be exactly 4 digits (0001-9999).");
+            continue;
+        }
 
         if (pin1 == pin2) {
             *newHash = hashPin(accountNum, pin1);
@@ -329,7 +430,7 @@ int promptDouble(const char *prompt, double *value)
 
     errno = 0;
     temp = strtod(input, &end);
-    if (errno != 0 || end == input || *end != '\0') {
+    if (errno != 0 || end == input || *end != '\0' || !isfinite(temp) || fabs(temp) > MAX_ABS_AMOUNT) {
         puts("Invalid amount.");
         return 0;
     }
@@ -339,16 +440,60 @@ int promptDouble(const char *prompt, double *value)
 
 void logTransaction(const char *action, const char *details)
 {
-    FILE *logFile = fopen("transactions.log", "a");
+    FILE *logFile = fopen(LOG_FILE, "a");
     time_t now = time(NULL);
     struct tm *timeInfo = localtime(&now);
-    char timestamp[32];
+    char timestamp[32] = "unknown";
 
-    if (logFile) {
-        strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", timeInfo);
-        fprintf(logFile, "[%s] %s: %s\n", timestamp, action, details);
-        fclose(logFile);
+    if (logFile == NULL) return;
+    if (timeInfo != NULL) {
+        (void)strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", timeInfo);
     }
+
+    if (action == NULL) action = "UNKNOWN";
+    if (details == NULL) details = "";
+
+    fprintf(logFile, "[%s] %s: %s\n", timestamp, action, details);
+    fclose(logFile);
+}
+
+int lineMatchesAccount(const char *line, unsigned int accountNum)
+{
+    char needle[32];
+
+    if (line == NULL) return 0;
+
+    snprintf(needle, sizeof(needle), "acct=%u", accountNum);
+    if (strstr(line, needle) != NULL) return 1;
+
+    snprintf(needle, sizeof(needle), "from=%u", accountNum);
+    if (strstr(line, needle) != NULL) return 1;
+
+    snprintf(needle, sizeof(needle), "to=%u", accountNum);
+    if (strstr(line, needle) != NULL) return 1;
+
+    // Legacy patterns (older log messages)
+    snprintf(needle, sizeof(needle), "from %u", accountNum);
+    if (strstr(line, needle) != NULL) return 1;
+
+    snprintf(needle, sizeof(needle), "to %u", accountNum);
+    if (strstr(line, needle) != NULL) return 1;
+
+    snprintf(needle, sizeof(needle), "Account %u", accountNum);
+    const char *pos = strstr(line, needle);
+    if (pos != NULL) {
+        char next = pos[strlen(needle)];
+        if (next == '\0' || !isdigit((unsigned char)next)) return 1;
+    }
+
+    snprintf(needle, sizeof(needle), "Acct %u", accountNum);
+    pos = strstr(line, needle);
+    if (pos != NULL) {
+        char next = pos[strlen(needle)];
+        if (next == '\0' || !isdigit((unsigned char)next)) return 1;
+    }
+
+    return 0;
 }
 
 // --- MAIN FEATURES ---
@@ -360,9 +505,18 @@ void newRecord(FILE *fPtr)
     char details[160];
     struct clientData client = {0, "", "", 0.0};
 
-    if (!promptUnsignedInRange("Enter new account number ( 1 - 100 ): ", 1, MAX_ACCOUNTS, &accountNum)) return;
+    char prompt[64];
+    snprintf(prompt, sizeof(prompt), "Enter new account number ( 1 - %u ): ", MAX_ACCOUNTS);
+    if (!promptUnsignedInRange(prompt, 1, MAX_ACCOUNTS, &accountNum)) {
+        waitForEnter();
+        return;
+    }
 
-    if (!readRecord(fPtr, accountNum, &client)) return;
+    if (!readRecord(fPtr, accountNum, &client)) {
+        printSystemError("Failed to read account database");
+        waitForEnter();
+        return;
+    }
     
     if (client.acctNum == accountNum) {
         printf("Account #%u already exists.\n", client.acctNum);
@@ -379,20 +533,39 @@ void newRecord(FILE *fPtr)
         waitForEnter();
         return;
     }
+    if (!isfinite(client.balance) || client.balance < 0.0 || client.balance > MAX_ABS_AMOUNT) {
+        puts("Invalid opening balance.");
+        waitForEnter();
+        return;
+    }
 
     // Force PIN setup
     puts("\n--- SETUP SECURITY PIN ---");
-    if (!promptForNewPin(accountNum, &pinHash)) return;
+    if (!promptForNewPin(accountNum, &pinHash)) {
+        waitForEnter();
+        return;
+    }
 
     client.acctNum = accountNum;
     
     if (writeRecord(fPtr, accountNum, &client)) {
-        writePinHash(accountNum, pinHash); // Store the Hash
-        printMessageBox("SUCCESS", "Account created and PIN hashed.");
-        snprintf(details, sizeof(details), "Account %u created", accountNum);
+        if (!writePinHash(accountNum, pinHash)) {
+            printSystemError("Failed to store PIN");
+            struct clientData blankClient = {0};
+            if (!writeRecord(fPtr, accountNum, &blankClient)) {
+                printSystemError("Rollback failed (account record)");
+            }
+            snprintf(details, sizeof(details), "acct=%u reason=pin_store_failed", accountNum);
+            logTransaction("CREATE_FAIL", details);
+            printMessageBox("ERROR", "Account creation rolled back. Please try again.");
+            waitForEnter();
+            return;
+        }
+        printMessageBox("SUCCESS", "Account created.");
+        snprintf(details, sizeof(details), "acct=%u last=%s first=%s opening_balance=%.2f", accountNum, client.lastName, client.firstName, client.balance);
         logTransaction("CREATE", details);
     } else {
-        puts("Failed to create account.");
+        printSystemError("Failed to create account");
     }
     waitForEnter();
 }
@@ -405,7 +578,10 @@ void updateRecord(FILE *fPtr)
     char details[160];
     struct clientData client = {0, "", "", 0.0};
 
-    if (!promptUnsignedInRange("Enter account to update: ", 1, MAX_ACCOUNTS, &account)) return;
+    if (!promptUnsignedInRange("Enter account to update: ", 1, MAX_ACCOUNTS, &account)) {
+        waitForEnter();
+        return;
+    }
     if (!readRecord(fPtr, account, &client) || client.acctNum != account) {
         puts("Account not found.");
         waitForEnter();
@@ -419,18 +595,26 @@ void updateRecord(FILE *fPtr)
     }
 
     printf("Current Balance: %.2f\n", client.balance);
-    if (!promptDouble("Enter charge (+) or payment (-): ", &transaction)) return;
-
-    if (client.balance + transaction < 0.0) {
-        puts("Transaction rejected: insufficient balance.");
+    if (!promptDouble("Enter charge (+) or payment (-): ", &transaction)) {
+        waitForEnter();
         return;
     }
 
-    client.balance += transaction;
+    double oldBalance = client.balance;
+    double newBalance = client.balance + transaction;
+    if (!isfinite(newBalance) || newBalance < 0.0) {
+        puts("Transaction rejected: insufficient balance.");
+        waitForEnter();
+        return;
+    }
+
+    client.balance = newBalance;
     if (writeRecord(fPtr, account, &client)) {
         printf("New Balance: %.2f\n", client.balance);
-        snprintf(details, sizeof(details), "Acct %u updated by %.2f", account, transaction);
+        snprintf(details, sizeof(details), "acct=%u delta=%.2f before=%.2f after=%.2f", account, transaction, oldBalance, client.balance);
         logTransaction("UPDATE", details);
+    } else {
+        printSystemError("Failed to write account database");
     }
     waitForEnter();
 }
@@ -442,7 +626,10 @@ void deleteRecord(FILE *fPtr)
     struct clientData client = {0};
     struct clientData blankClient = {0};
 
-    if (!promptUnsignedInRange("Enter account number: ", 1, MAX_ACCOUNTS, &accountNum)) return;
+    if (!promptUnsignedInRange("Enter account number: ", 1, MAX_ACCOUNTS, &accountNum)) {
+        waitForEnter();
+        return;
+    }
     if (!readRecord(fPtr, accountNum, &client) || client.acctNum != accountNum) {
         puts("Account not found.");
         waitForEnter();
@@ -456,9 +643,15 @@ void deleteRecord(FILE *fPtr)
     }
 
     if (writeRecord(fPtr, accountNum, &blankClient)) {
-        writePinHash(accountNum, 0); // Clear hash
+        if (!writePinHash(accountNum, 0)) {
+            printSystemError("Failed to clear PIN");
+        }
         printMessageBox("SUCCESS", "Account deleted.");
-        logTransaction("DELETE", "Account deleted");
+        char details[160];
+        snprintf(details, sizeof(details), "acct=%u last=%s first=%s", accountNum, client.lastName, client.firstName);
+        logTransaction("DELETE", details);
+    } else {
+        printSystemError("Failed to delete account");
     }
     waitForEnter();
 }
@@ -470,14 +663,20 @@ void transferFunds(FILE *fPtr)
     double amount;
     struct clientData fromClient = {0}, toClient = {0};
 
-    if (!promptUnsignedInRange("Transfer FROM account: ", 1, MAX_ACCOUNTS, &fromAccount)) return;
+    if (!promptUnsignedInRange("Transfer FROM account: ", 1, MAX_ACCOUNTS, &fromAccount)) {
+        waitForEnter();
+        return;
+    }
     if (!readRecord(fPtr, fromAccount, &fromClient) || fromClient.acctNum == 0) {
         puts("Source account not found.");
         waitForEnter();
         return;
     }
 
-    if (!promptUnsignedInRange("Transfer TO account: ", 1, MAX_ACCOUNTS, &toAccount)) return;
+    if (!promptUnsignedInRange("Transfer TO account: ", 1, MAX_ACCOUNTS, &toAccount)) {
+        waitForEnter();
+        return;
+    }
     if (!readRecord(fPtr, toAccount, &toClient) || toClient.acctNum == 0) {
         puts("Destination account not found.");
         waitForEnter();
@@ -509,14 +708,30 @@ void transferFunds(FILE *fPtr)
         return;
     }
 
+    struct clientData fromOriginal = fromClient;
+    struct clientData toOriginal = toClient;
+    double fromBefore = fromClient.balance;
+    double toBefore = toClient.balance;
+
     fromClient.balance -= amount;
     toClient.balance += amount;
+    if (!isfinite(fromClient.balance) || !isfinite(toClient.balance) || fromClient.balance < 0.0) {
+        puts("Transfer rejected due to invalid resulting balance.");
+        waitForEnter();
+        return;
+    }
 
-    if (writeRecord(fPtr, fromAccount, &fromClient) && writeRecord(fPtr, toAccount, &toClient)) {
+    if (writeTwoRecordsAtomic(
+            fPtr,
+            fromAccount, &fromOriginal, &fromClient,
+            toAccount, &toOriginal, &toClient)) {
         printMessageBox("SUCCESS", "Transfer complete.");
         char logMsg[100];
-        snprintf(logMsg, sizeof(logMsg), "%.2f from %u to %u", amount, fromAccount, toAccount);
+        snprintf(logMsg, sizeof(logMsg), "from=%u to=%u amount=%.2f from_before=%.2f from_after=%.2f to_before=%.2f to_after=%.2f",
+                 fromAccount, toAccount, amount, fromBefore, fromClient.balance, toBefore, toClient.balance);
         logTransaction("TRANSFER", logMsg);
+    } else {
+        printSystemError("Transfer failed while writing account database");
     }
     waitForEnter();
 }
@@ -527,7 +742,10 @@ void changePin(FILE *fPtr)
     unsigned int accountNum, newHash;
     struct clientData client = {0};
 
-    if (!promptUnsignedInRange("Enter account number: ", 1, MAX_ACCOUNTS, &accountNum)) return;
+    if (!promptUnsignedInRange("Enter account number: ", 1, MAX_ACCOUNTS, &accountNum)) {
+        waitForEnter();
+        return;
+    }
     if (!readRecord(fPtr, accountNum, &client) || client.acctNum == 0) {
         puts("Account not found.");
         waitForEnter();
@@ -542,9 +760,14 @@ void changePin(FILE *fPtr)
     }
 
     if (promptForNewPin(accountNum, &newHash)) {
-        writePinHash(accountNum, newHash);
-        printMessageBox("SUCCESS", "PIN changed successfully.");
-        logTransaction("PIN_CHANGE", "User changed PIN");
+        if (!writePinHash(accountNum, newHash)) {
+            printSystemError("Failed to store PIN");
+        } else {
+            printMessageBox("SUCCESS", "PIN changed successfully.");
+            char details[96];
+            snprintf(details, sizeof(details), "acct=%u pin_changed=1", accountNum);
+            logTransaction("PIN_CHANGE", details);
+        }
     }
     waitForEnter();
 }
@@ -555,8 +778,9 @@ void textFile(FILE *readPtr)
     struct clientData client = {0};
     unsigned int account;
 
-    if ((writePtr = fopen("accounts.txt", "w")) == NULL) {
-        puts("File error.");
+    if ((writePtr = fopen(ACCOUNTS_EXPORT_FILE, "w")) == NULL) {
+        printSystemError("Could not create export file");
+        waitForEnter();
         return;
     }
 
@@ -566,8 +790,11 @@ void textFile(FILE *readPtr)
             fprintf(writePtr, "%-6u%-16s%-11s%10.2f\n", client.acctNum, client.lastName, client.firstName, client.balance);
         }
     }
-    fclose(writePtr);
-    puts("Exported to accounts.txt");
+    if (fclose(writePtr) != 0) {
+        printSystemError("Could not close export file");
+    } else {
+        printf("Exported to %s\n", ACCOUNTS_EXPORT_FILE);
+    }
     waitForEnter();
 }
 
@@ -585,6 +812,76 @@ void listRecords(FILE *fPtr)
     waitForEnter();
 }
 
+void viewStatement(FILE *fPtr)
+{
+    printScreenHeader("ACCOUNT STATEMENT");
+    unsigned int accountNum;
+    struct clientData client = {0};
+
+    if (!promptUnsignedInRange("Enter account number: ", 1, MAX_ACCOUNTS, &accountNum)) {
+        waitForEnter();
+        return;
+    }
+
+    if (!readRecord(fPtr, accountNum, &client) || client.acctNum == 0) {
+        puts("Account not found.");
+        waitForEnter();
+        return;
+    }
+
+    if (!authenticateUser(accountNum)) {
+        waitForEnter();
+        return;
+    }
+
+    FILE *logPtr = fopen(LOG_FILE, "r");
+    if (logPtr == NULL) {
+        printSystemError("Could not open transaction log");
+        waitForEnter();
+        return;
+    }
+
+    char ring[STATEMENT_MAX_LINES][LOG_LINE_MAX] = {{0}};
+    unsigned int matchCount = 0;
+    char line[LOG_LINE_MAX];
+
+    while (fgets(line, sizeof(line), logPtr) != NULL) {
+        if (!lineMatchesAccount(line, accountNum)) continue;
+
+        unsigned int slot = matchCount % STATEMENT_MAX_LINES;
+        size_t i = 0;
+        while (i + 1 < LOG_LINE_MAX && line[i] != '\0') {
+            ring[slot][i] = line[i];
+            ++i;
+        }
+        ring[slot][i] = '\0';
+        matchCount++;
+    }
+
+    fclose(logPtr);
+
+    printf("\nAccount: %u  Name: %s %s\n", client.acctNum, client.firstName, client.lastName);
+    printf("Current Balance: %.2f\n", client.balance);
+
+    if (matchCount == 0) {
+        puts("\nNo transactions found for this account.");
+        waitForEnter();
+        return;
+    }
+
+    unsigned int linesToShow = matchCount < STATEMENT_MAX_LINES ? matchCount : STATEMENT_MAX_LINES;
+    unsigned int startIndex = (matchCount >= STATEMENT_MAX_LINES) ? (matchCount % STATEMENT_MAX_LINES) : 0;
+
+    puts("\n--- Last Transactions ---");
+    for (unsigned int i = 0; i < linesToShow; ++i) {
+        const char *entry = ring[(startIndex + i) % STATEMENT_MAX_LINES];
+        fputs(entry, stdout);
+        if (entry[0] != '\0' && entry[strlen(entry) - 1] != '\n') putchar('\n');
+    }
+
+    waitForEnter();
+}
+
 unsigned int enterChoice(void)
 {
     char menuChoice[32];
@@ -599,14 +896,19 @@ unsigned int enterChoice(void)
                      "|           [5] List Active Accounts                       |\n"
                      "|           [6] Transfer Funds (Auth Required)             |\n"
                      "|           [7] Change PIN                                 |\n"
-                     "|           [8] Exit                                       |\n"
+                     "|           [8] View Statement (Auth Required)             |\n"
+                     "|           [9] Exit                                       |\n"
                      "+----------------------------------------------------------+\n"
                      "Enter choice: ");
 
-        if (!readLine(menuChoice, sizeof(menuChoice))) return 8;
+        if (!readLine(menuChoice, sizeof(menuChoice))) return 9;
 
-        int c = atoi(menuChoice);
-        if (c >= 1 && c <= 8) return c;
+        errno = 0;
+        char *end = NULL;
+        unsigned long parsed = strtoul(menuChoice, &end, 10);
+        if (errno == 0 && end != menuChoice && *end == '\0' && parsed >= 1 && parsed <= 9) {
+            return (unsigned int)parsed;
+        }
         puts("Invalid choice.");
     }
 }
@@ -619,18 +921,26 @@ int main(int argc, char *argv[])
     srand((unsigned int)time(NULL));
 
     if ((cfPtr = fopen(DATA_FILE, "rb+")) == NULL) {
-        if ((cfPtr = fopen(DATA_FILE, "wb+")) == NULL) {
-            puts("File could not be opened.");
+        cfPtr = fopen(DATA_FILE, "wb+");
+        if (cfPtr == NULL) {
+            printSystemError("Could not open data file");
             return 1;
         }
     }
 
-    if (!ensureFileInitialized(cfPtr) || !ensurePinFileInitialized()) {
-        puts("Initialization failed.");
+    if (!ensureFileInitialized(cfPtr)) {
+        printSystemError("Data file initialization failed");
+        fclose(cfPtr);
         return 1;
     }
 
-    while ((choice = enterChoice()) != 8) {
+    if (!ensurePinFileInitialized()) {
+        printSystemError("PIN database initialization failed");
+        fclose(cfPtr);
+        return 1;
+    }
+
+    while ((choice = enterChoice()) != 9) {
         switch (choice) {
             case 1: textFile(cfPtr); break;
             case 2: updateRecord(cfPtr); break;
@@ -639,6 +949,7 @@ int main(int argc, char *argv[])
             case 5: listRecords(cfPtr); break;
             case 6: transferFunds(cfPtr); break;
             case 7: changePin(cfPtr); break;
+            case 8: viewStatement(cfPtr); break;
             default: puts("Error"); break;
         }
     }
