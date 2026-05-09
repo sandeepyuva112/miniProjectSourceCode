@@ -1,0 +1,21 @@
+# Build outputs
+build*/
+*.o
+*.obj
+*.exe
+*.out
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+
+# Runtime data / logs
+accounts.txt
+credit.dat
+pins.dat
+transactions.log
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
